@@ -277,6 +277,9 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # name in the runner's tool dispatch — reserved here so user specs
     # cannot shadow it.
     "sys_advise_models": None,
+    # Always registered by ToolManager and executed through the current
+    # session's server route. Reserved here so specs cannot shadow it.
+    "sys_roadmap_authority": None,
     # ``browser_*`` embedded-browser tools are framework-owned: always
     # auto-registered by ``ToolManager._register_browser_tools`` (the
     # single source of truth for registration), so any agent can drive

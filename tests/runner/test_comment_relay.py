@@ -381,6 +381,7 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_agent_download",
         "sys_add_policy",
         "sys_policy_registry",
+        "sys_roadmap_authority",
         "sys_os_read",
         "sys_os_write",
         "sys_os_edit",

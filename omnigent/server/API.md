@@ -1058,6 +1058,34 @@ which is what policy ASK gates rely on, so the verdict cannot be
 conflated with a generic session event. Any value other than
 `action: "accept"` denies.
 
+### Structured roadmap authority
+
+`POST /v1/sessions/{session_id}/roadmap-authority` backs the always-available
+`sys_roadmap_authority` tool. Its `request` action accepts protocol
+`clai-roadmap-authority/v1` and one exact envelope containing the authority
+reference, roadmap item, Audit/Memory/WPLab project and host, immutable
+workspace, scope entries, allowed operations, USD/provider-call/checkpoint/time
+ceilings, explicit stop conditions, and all six mandatory excluded-effect hard
+stops. The server verifies the live session binding, persists pending state,
+publishes the existing `response.elicitation_request`, and waits for the
+session-scoped authorized verdict. Decline, cancel, disconnect, timeout,
+unsupported identity/protocol, changed state, or replay fails closed with a
+`BLOCKED` receipt.
+
+After approval, the `checkpoint` action must provide a unique checkpoint ID and
+echo the authority ID and envelope digest plus the exact host/project/workspace,
+one approved scope entry, one allowed operation, and the budget/call
+reservation. Reservations are persisted and consumptive. Changed bindings or
+envelopes, expired authority, duplicate checkpoints, and exhausted caps fail
+closed. Production, central control-plane/recovery, secret, destructive-data,
+and scope-expansion risk flags are unconditional hard stops.
+
+A `PERMITTED` checkpoint is an Omnigent authority receipt, not a claim that
+Omnigent can intercept arbitrary shell commands, MCP servers, provider SDKs, or
+other external tools. An agent or guarded operator integration must request the
+checkpoint before every governed effect and honor the reservation; tools
+outside that integration are not technically constrained by this protocol.
+
 ### Fork Session
 
 ```

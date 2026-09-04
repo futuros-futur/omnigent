@@ -147,6 +147,7 @@ def test_builtin_names_size_matches_registry() -> None:
                 # is enabled (RuntimeCaps.routing_client is set).
                 "sys_list_models",
                 "sys_advise_models",
+                "sys_roadmap_authority",
                 # Embedded-browser tools: always registered (schema-only
                 # Tool classes; execution is runner-dispatched via the
                 # _BROWSER_TOOLS branch in runner/tool_dispatch.py).

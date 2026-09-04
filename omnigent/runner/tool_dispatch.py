@@ -181,6 +181,9 @@ _SESSION_WRAPPER_LABEL_KEY = "omnigent.wrapper"
 # still fails out promptly. Guarded by tests/test_ask_timeout_infinite.py.
 _ASK_GATE_DELIVERY_READ_TIMEOUT_S: float = 86400.0
 _ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, connect=30.0)
+# The authority envelope permits at most seven days. Keep the proxy read
+# budget just above that ceiling so it never severs a still-valid owner prompt.
+_ROADMAP_AUTHORITY_TIMEOUT = httpx.Timeout(604_830.0, connect=30.0)
 
 # Read timeouts for the two MCP-proxy hops that carry a tool call back to the
 # runner (runner → Omnigent server → runner). ``sys_os_shell`` accepts caller-provided
@@ -393,6 +396,10 @@ _AGENT_TOOLS = frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list
 # The runner proxies the Omnigent server's session policy REST endpoint.
 _POLICY_TOOLS = frozenset({"sys_add_policy", "sys_policy_registry"})
 
+# Structured roadmap-authority requests and checkpoints are proxied to the
+# current session so approval, binding, and accounting stay server-owned.
+_ROADMAP_AUTHORITY_TOOLS = frozenset({"sys_roadmap_authority"})
+
 # Priority 5l.1: Scheduled-task management — the runner proxies the Omnigent
 # server's /v1/scheduled-tasks REST endpoints (same posture as _POLICY_TOOLS).
 _SCHEDULED_TASK_TOOLS = frozenset(
@@ -462,6 +469,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
     | _POLICY_TOOLS
+    | _ROADMAP_AUTHORITY_TOOLS
     | _SCHEDULED_TASK_TOOLS
     | _TERMINAL_TOOLS
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
@@ -547,6 +555,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
                 _append(function)
     else:
         from omnigent.tools.builtins.policy import SysAddPolicyTool, SysPolicyRegistryTool
+        from omnigent.tools.builtins.roadmap_authority import SysRoadmapAuthorityTool
 
         for _cls in (
             ListCommentsTool,
@@ -560,6 +569,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysAgentDownloadTool,
             SysAddPolicyTool,
             SysPolicyRegistryTool,
+            SysRoadmapAuthorityTool,
         ):
             fallback_schema = _string_object_dict(_cls().get_schema())
             if fallback_schema is None:
@@ -872,6 +882,7 @@ _ALL_LOCAL_TOOLS = (
     | _COMMENT_TOOLS
     | _AGENT_TOOLS
     | _POLICY_TOOLS
+    | _ROADMAP_AUTHORITY_TOOLS
     | _SCHEDULED_TASK_TOOLS
 )
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
@@ -3892,6 +3903,44 @@ async def _execute_policy_tool(
     return await _execute_add_policy(args, conversation_id, server_client)
 
 
+async def _execute_roadmap_authority_tool(
+    args: _JsonObject,
+    *,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Proxy a structured authority action to the current session route."""
+    if server_client is None or conversation_id is None:
+        return json.dumps({"status": "BLOCKED", "reason": "missing_session_identity"})
+    try:
+        response = await server_client.post(
+            f"/v1/sessions/{conversation_id}/roadmap-authority",
+            json=args,
+            timeout=_ROADMAP_AUTHORITY_TIMEOUT,
+        )
+    except Exception as exc:  # noqa: BLE001 - tool output must fail closed
+        return json.dumps(
+            {
+                "status": "BLOCKED",
+                "reason": f"authority_request_failed:{type(exc).__name__}",
+            }
+        )
+    if response.status_code != 200:
+        return json.dumps(
+            {
+                "status": "BLOCKED",
+                "reason": f"authority_server_returned_{response.status_code}",
+            }
+        )
+    try:
+        payload = response.json()
+    except ValueError:
+        return json.dumps({"status": "BLOCKED", "reason": "malformed_authority_response"})
+    if not isinstance(payload, dict):
+        return json.dumps({"status": "BLOCKED", "reason": "malformed_authority_response"})
+    return json.dumps(payload)
+
+
 async def _execute_list_policies(
     server_client: httpx.AsyncClient,
 ) -> str:
@@ -5751,12 +5800,24 @@ async def execute_tool(
         not tracked — shell side-effects cannot be attributed to a session.
     :returns: Tool output string.
     """
-    if not arguments.strip():
-        return json.dumps({"error": "malformed JSON arguments"})
-    args, error = parse_json_object_arguments(arguments)
-    if error is not None:
-        return json.dumps({"error": error})
-    assert args is not None
+    if tool_name in _ROADMAP_AUTHORITY_TOOLS:
+        if not arguments.strip():
+            return json.dumps({"status": "BLOCKED", "reason": "malformed_json"})
+        try:
+            authority_args = json.loads(arguments)
+        except json.JSONDecodeError:
+            return json.dumps({"status": "BLOCKED", "reason": "malformed_json"})
+        if not isinstance(authority_args, dict):
+            return json.dumps({"status": "BLOCKED", "reason": "malformed_request"})
+        args: _JsonObject = authority_args
+    else:
+        if not arguments.strip():
+            return json.dumps({"error": "malformed JSON arguments"})
+        parsed_args, error = parse_json_object_arguments(arguments)
+        if error is not None:
+            return json.dumps({"error": error})
+        assert parsed_args is not None
+        args = parsed_args
 
     try:
         if mcp_manager is not None:
@@ -5949,6 +6010,12 @@ async def execute_tool(
             output = await _execute_policy_tool(
                 tool_name,
                 arguments,
+                conversation_id=conversation_id,
+                server_client=server_client,
+            )
+        elif tool_name in _ROADMAP_AUTHORITY_TOOLS:
+            output = await _execute_roadmap_authority_tool(
+                args,
                 conversation_id=conversation_id,
                 server_client=server_client,
             )

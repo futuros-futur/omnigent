@@ -189,6 +189,9 @@ class ToolManager:
         # Policy tool is always auto-registered so agents can add
         # inline CEL policies at runtime without spec changes.
         self._register_policy_tools()
+        # Structured roadmap authority is framework-owned and always
+        # available; execution remains session-bound on the server.
+        self._register_roadmap_authority_tool()
         # Scheduled-task tools are always auto-registered so agents can
         # manage recurring runs at runtime without the spec opting in.
         self._register_scheduled_task_tools()
@@ -196,6 +199,12 @@ class ToolManager:
         # can drive the desktop app's browser without the spec opting in
         # (framework-owned).
         self._register_browser_tools()
+
+    def _register_roadmap_authority_tool(self) -> None:
+        """Register the server-backed structured authority protocol."""
+        from omnigent.tools.builtins.roadmap_authority import SysRoadmapAuthorityTool
+
+        self._tools[SysRoadmapAuthorityTool.name()] = SysRoadmapAuthorityTool()
 
     def _register_policy_tools(self) -> None:
         """
