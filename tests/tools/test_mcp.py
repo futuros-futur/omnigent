@@ -13,6 +13,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
 from cachetools import TTLCache
 from mcp.shared.exceptions import McpError
 from mcp.types import CONNECTION_CLOSED, CallToolResult, ErrorData, ImageContent, TextContent
@@ -939,6 +940,60 @@ async def test_call_tool_reconnects_on_connection_error() -> None:
     await conn.close()
 
 
+def test_anyio_terminal_stream_errors_are_reconnectable() -> None:
+    """AnyIO's terminal stream errors represent a dead MCP transport."""
+    for exc in (ClosedResourceError(), BrokenResourceError(), EndOfStream()):
+        assert _is_connection_error(exc)
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_repairs_a_dead_lifecycle_before_invocation() -> None:
+    """A cached session object is not live when its lifecycle already ended."""
+    conn = McpServerConnection(config=_make_http_config())
+    conn._session = MagicMock()
+    dead_lifecycle = asyncio.create_task(asyncio.sleep(0))
+    await dead_lifecycle
+    conn._lifecycle_task = dead_lifecycle
+
+    with patch.object(conn, "_reconnect", new_callable=AsyncMock) as reconnect:
+        with patch(
+            "omnigent.tools.mcp._call_tool_with_reconnect",
+            new=AsyncMock(return_value="ok"),
+        ):
+            assert await conn.call_tool("test_tool", {}) == "ok"
+
+    reconnect.assert_awaited_once_with(expected_lifecycle=dead_lifecycle)
+
+
+@pytest.mark.asyncio()
+async def test_concurrent_reconnect_replaces_observed_lifecycle_once() -> None:
+    """Two callers observing one dead lifecycle share one replacement."""
+    conn = McpServerConnection(config=_make_http_config())
+    old_lifecycle = asyncio.create_task(asyncio.sleep(0))
+    await old_lifecycle
+    conn._lifecycle_task = old_lifecycle
+    starts = 0
+
+    async def fake_lifecycle() -> None:
+        nonlocal starts
+        starts += 1
+        conn._session = MagicMock()
+        assert conn._ready_future is not None
+        conn._ready_future.set_result([])
+        assert conn._close_event is not None
+        await conn._close_event.wait()
+
+    with patch.object(conn, "_run_lifecycle", side_effect=fake_lifecycle):
+        await asyncio.gather(
+            conn._reconnect(expected_lifecycle=old_lifecycle),
+            conn._reconnect(expected_lifecycle=old_lifecycle),
+        )
+
+    assert starts == 1
+    assert conn.is_alive
+    await conn.close()
+
+
 @pytest.mark.asyncio()
 async def test_call_tool_does_not_reconnect_on_tool_error() -> None:
     """
@@ -1036,11 +1091,9 @@ async def test_call_tool_uses_config_retry_policy() -> None:
 
 
 @pytest.mark.asyncio()
-async def test_call_tool_sleeps_between_retries() -> None:
+async def test_call_tool_forwards_backoff_to_serialized_reconnect() -> None:
     """
-    ``call_tool()`` sleeps with backoff between reconnect
-    attempts. Verifies that the ``_sleep`` indirection is called
-    with increasing delays.
+    ``call_tool()`` sends increasing backoff delays into the reconnect lock.
     """
     # max_retries=2 → 3 total attempts (2 errors + 1 success).
     config = MCPServerConfig(
@@ -1067,22 +1120,17 @@ async def test_call_tool_sleeps_between_retries() -> None:
             ok_result,
         ]
 
-        with patch.object(conn, "_reconnect", new_callable=AsyncMock):
-            with patch(
-                "omnigent.tools.mcp._sleep",
-                new_callable=AsyncMock,
-            ) as mock_sleep:
-                result = await conn.call_tool("test_tool", {"query": "hi"})
+        with patch.object(conn, "_reconnect", new_callable=AsyncMock) as reconnect:
+            result = await conn.call_tool("test_tool", {"query": "hi"})
 
         assert result == "ok"
-        # Two sleeps: before retry 1 and before retry 2.
-        assert mock_sleep.await_count == 2
+        assert reconnect.await_count == 2
         # Delays computed by RetryPolicy.compute_backoff_delay:
         # retry_index=1 → 2.0 * 2^0 = 2.0; retry_index=2 → 2.0 * 2^1 = 4.0.
         # Jitter is uniform[0.5, 1.5], so delay 1 ∈ [1.0, 3.0],
         # delay 2 ∈ [2.0, 6.0].
-        delay_1 = mock_sleep.await_args_list[0].args[0]
-        delay_2 = mock_sleep.await_args_list[1].args[0]
+        delay_1 = reconnect.await_args_list[0].kwargs["delay"]
+        delay_2 = reconnect.await_args_list[1].kwargs["delay"]
         assert 1.0 <= delay_1 <= 3.0
         assert 2.0 <= delay_2 <= 6.0
 

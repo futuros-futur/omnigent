@@ -34,6 +34,7 @@ from omnigent.runner.mcp_manager import (
     _POOL_SPEC_CAPACITY,
     McpSchemasResult,
     RunnerMcpManager,
+    _SharedServerEntry,
     compute_server_hash,
     compute_spec_hash,
 )
@@ -91,6 +92,41 @@ class _FakeConn:
         """Record the invocation; return a deterministic stub."""
         self.call_tool_calls.append((name, arguments))
         return f"called {name} with {arguments}"
+
+    @property
+    def is_alive(self) -> bool:
+        """The fixture models a live connected transport."""
+        return True
+
+
+@pytest.mark.asyncio
+async def test_dead_cached_connection_is_invalidated_before_reconnect() -> None:
+    """A dead lifecycle cannot remain routable through cached tools."""
+    manager = RunnerMcpManager()
+    config = _make_config("runtime")
+    connection = _mcp_manager_module.McpServerConnection(config=config)
+    entry = _SharedServerEntry(
+        server_hash="server-hash",
+        config=config,
+        connection=connection,
+        tools=[_make_tool_def("run")],
+    )
+    blocker = asyncio.Event()
+
+    async def blocked_connect(*_args: object) -> None:
+        await blocker.wait()
+
+    manager._connect_server = blocked_connect  # type: ignore[method-assign]
+    task = manager._ensure_connect_task(entry, "spec-hash")
+
+    assert task is not None
+    assert entry.connection is None
+    assert entry.tools == []
+    assert entry.error == "MCP lifecycle terminated"
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    if manager._evict_tasks:
+        await asyncio.gather(*list(manager._evict_tasks), return_exceptions=True)
 
 
 @pytest.fixture()

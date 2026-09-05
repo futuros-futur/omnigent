@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import urlparse
 
+from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
 from anyio.streams.memory import (
     MemoryObjectReceiveStream,
     MemoryObjectSendStream,
@@ -459,6 +460,9 @@ class McpServerConnection:
     # safe to read in the elicitation handler (which runs on the
     # SDK's receive-loop task, not the caller's task).
     _call_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+    # Serializes replacement of a failed lifecycle so concurrent callers that
+    # observed the same dead task cannot tear down each other's fresh session.
+    _reconnect_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     # Session id for the in-flight tool call, set under
     # ``_call_lock`` so only one call is active at a time.
     _active_session_id: str | None = field(default=None, init=False, repr=False)
@@ -549,7 +553,7 @@ class McpServerConnection:
         :raises McpServerDisabledError: If the circuit breaker is
             tripped.
         """
-        if self._session is None:
+        if self._session is None and self._lifecycle_task is None:
             raise RuntimeError(
                 f"MCP server {self.config.name!r} has no live "
                 f"session — call connect() before call_tool()"
@@ -557,6 +561,8 @@ class McpServerConnection:
         self._breaker.pre_call(self.config.name)
         retry = self.config.retry or _MCP_RECONNECT_DEFAULTS
         try:
+            if not self.is_alive:
+                await self._reconnect(expected_lifecycle=self._lifecycle_task)
             result = await _call_tool_with_reconnect(
                 conn=self,
                 name=name,
@@ -687,7 +693,18 @@ class McpServerConnection:
             )
         return _format_call_result(result)
 
-    async def _reconnect(self) -> None:
+    @property
+    def is_alive(self) -> bool:
+        """Return whether the session and its owning lifecycle are both live."""
+        task = self._lifecycle_task
+        return self._session is not None and task is not None and not task.done()
+
+    async def _reconnect(
+        self,
+        *,
+        expected_lifecycle: asyncio.Task[None] | None = None,
+        delay: float = 0.0,
+    ) -> None:
         """
         Tear down the dead session and open a fresh one.
 
@@ -700,12 +717,23 @@ class McpServerConnection:
         new lifecycle task owns the new transport + session
         end to end.
         """
-        await self.close()
-        loop = asyncio.get_running_loop()
-        self._ready_future = loop.create_future()
-        self._close_event = asyncio.Event()
-        self._lifecycle_task = asyncio.create_task(self._run_lifecycle())
-        await self._ready_future
+        async with self._reconnect_lock:
+            if (
+                expected_lifecycle is not None
+                and self._lifecycle_task is not expected_lifecycle
+                and self.is_alive
+            ):
+                return
+
+            self._session = None
+            if delay > 0:
+                await _sleep(delay)
+            await self.close()
+            loop = asyncio.get_running_loop()
+            self._ready_future = loop.create_future()
+            self._close_event = asyncio.Event()
+            self._lifecycle_task = asyncio.create_task(self._run_lifecycle())
+            await self._ready_future
 
     async def _run_lifecycle(self) -> None:
         """
@@ -1257,6 +1285,9 @@ _CONNECTION_ERROR_TYPES = (
     BrokenPipeError,
     ConnectionError,
     OSError,
+    ClosedResourceError,
+    BrokenResourceError,
+    EndOfStream,
 )
 
 
@@ -1354,6 +1385,7 @@ async def _call_tool_with_reconnect(
     total_tries = retry.max_retries + 1
 
     for attempt in range(total_tries):
+        lifecycle = conn._lifecycle_task
         try:
             return await conn._invoke_tool(name, arguments, session_id=session_id)
         except Exception as exc:
@@ -1373,8 +1405,7 @@ async def _call_tool_with_reconnect(
                 total_tries,
                 delay,
             )
-            await _sleep(delay)
-            await conn._reconnect()
+            await conn._reconnect(expected_lifecycle=lifecycle, delay=delay)
 
     # All attempts exhausted — re-raise the last connection error.
     assert last_exc is not None

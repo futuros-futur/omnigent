@@ -725,7 +725,13 @@ class RunnerMcpManager:
     ) -> asyncio.Task[None] | None:
         """Return an in-flight shared connect task, creating one if needed."""
         if server.connection is not None:
-            return None
+            if getattr(server.connection, "is_alive", True):
+                return None
+            stale = server.connection
+            server.connection = None
+            server.tools = []
+            server.error = "MCP lifecycle terminated"
+            self._schedule_close(stale, spec_hash, server.config.name)
         if server.connect_task is None or server.connect_task.done():
             server.connect_task = asyncio.create_task(
                 self._connect_server(server, spec_hash),

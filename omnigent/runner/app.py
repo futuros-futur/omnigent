@@ -215,6 +215,18 @@ def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> N
     :param sub_agent_name: The name that failed to resolve in the parent
         spec tree.
     """
+    if sub_agent_name == "audit_runtime_operator":
+        _logger.error(
+            "Privileged sub-agent %r for session %s did not resolve; refusing "
+            "parent-spec fallback",
+            sub_agent_name,
+            session_id,
+        )
+        raise OmnigentError(
+            f"Privileged sub-agent {sub_agent_name!r} did not resolve exactly",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
     _logger.warning(
         "Sub-agent %r for session %s did not resolve in the parent spec; "
         "falling back to the parent spec (child runs with the parent's "
